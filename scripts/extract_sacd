@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+#
+# extract_sacd.sh
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025 Mohamad Adithya
+#
+# SACD ISO Extractor
+#
+# Description:
+#   Simple wrapper around `sacd_extract` to extract DSD (DSF) tracks
+#   from SACD ISO images. Automatically creates the output folder
+#   if it does not exist.
+#
+# Requirements:
+#   - sacd_extract (e.g. via Homebrew or other package managers)
+#
+# Usage:
+#   extract_sacd.sh <path-to-iso> [output-folder]
+#
+# Examples:
+#   extract_sacd.sh ~/Music/SACD/Aretha.iso
+#   extract_sacd.sh ~/Music/SACD/Aretha.iso ~/Desktop/Output
+#
+
+set -euo pipefail
+
+SCRIPT_NAME="$(basename "$0")"
+
+print_help() {
+  cat <<EOF
+SACD ISO Extractor – extract DSF tracks from SACD ISO images
+
+Usage:
+  ${SCRIPT_NAME} <path-to-iso> [output-folder]
+
+Arguments:
+  path-to-iso    Path to the SACD ISO file.
+  output-folder  Optional output folder. If omitted, defaults to:
+                 \$HOME/Music/DSF
+
+Behavior:
+  - Ensures the output directory exists (creates it if necessary).
+  - Invokes sacd_extract with:
+      -s   : convert to stereo
+      -c   : convert to DSF
+      -2   : extract 2-channel (stereo) area
+  - Prints a clear success or failure message.
+
+Examples:
+  ${SCRIPT_NAME} ~/Music/SACD/Aretha.iso
+  ${SCRIPT_NAME} ~/Music/SACD/Aretha.iso ~/Desktop/Aretha_DSF
+
+Requirements:
+  - sacd_extract must be available in PATH.
+
+Options:
+  -h, --help     Show this help message and exit
+EOF
+}
+
+# -------- Argument parsing --------
+
+if (( $# == 0 )); then
+  echo "❌ Missing ISO path."
+  echo "   Usage: ${SCRIPT_NAME} <path-to-iso> [output-folder]"
+  echo "   Run '${SCRIPT_NAME} --help' for more details."
+  exit 1
+fi
+
+case "${1:-}" in
+  -h|--help)
+    print_help
+    exit 0
+    ;;
+esac
+
+ISO="$1"
+OUT="${2:-$HOME/Music/DSF}"  # default output if not provided
+
+# -------- Dependency check --------
+
+if ! command -v sacd_extract >/dev/null 2>&1; then
+  echo "❌ 'sacd_extract' not found in PATH." >&2
+  echo "   Please install it first (e.g. via Homebrew or your package manager)." >&2
+  exit 1
+fi
+
+# -------- Validate input ISO --------
+
+if [[ -z "$ISO" ]]; then
+  echo "❌ ISO path is empty."
+  echo "   Usage: ${SCRIPT_NAME} <path-to-iso> [output-folder]"
+  exit 1
+fi
+
+if [[ ! -f "$ISO" ]]; then
+  echo "❌ ISO file not found: $ISO"
+  exit 1
+fi
+
+# -------- Ensure output directory exists --------
+
+mkdir -p "$OUT"
+
+# -------- Start extraction --------
+
+echo "🎶 Extracting SACD ISO:"
+echo "   ISO   : $ISO"
+echo "   Output: $OUT"
+echo
+
+# -s : stereo, -c : DSF, -2 : 2-channel area
+if sacd_extract -i "$ISO" -s -c -2 -o "$OUT"; then
+  echo
+  echo "✅ Extraction complete!"
+  echo "📁 Files saved in: $OUT"
+else
+  echo
+  echo "⚠️  Extraction failed. Check permissions, 'sacd_extract' version, or ISO integrity."
+  exit 1
+fi
+

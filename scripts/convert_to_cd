@@ -1,0 +1,275 @@
+#!/usr/bin/env bash
+#
+# smart_hires_to_cd.sh
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025 Mohamad Adithya
+#
+# Hi-Res → CD-quality converter
+#
+# Features:
+#   - Converts any sample rate / bit depth → 44.1 kHz / 16-bit FLAC
+#   - Skips re-encode if source is already 44.1 kHz / 16-bit
+#     (in that case, the file is just copied to the output directory)
+#   - Single overall progress indicator based on total duration (all files)
+#
+# Default behavior:
+#   - Input directory: current directory (.)
+#   - Output directory: IN_DIR/_CD_44k16bit
+#
+# Usage:
+#   convert_to_cd.sh
+#   convert_to_cd.sh IN_DIR
+#   convert_to_cd.sh IN_DIR OUT_DIR
+#
+# Notes:
+#   - Non-recursive: only files directly under IN_DIR are scanned.
+#   - Supported extensions: flac, wav, aiff, aif, m4a, alac
+#   - Uses ffprobe + ffmpeg; both must be available in PATH.
+#
+# WARNING:
+#   We intentionally DO NOT use `set -e` or `set -o pipefail` here because
+#   this script relies on `ffmpeg ... | while read ...` pipelines for progress.
+#   Using `set -e`/`pipefail` can unintentionally break those loops.
+#
+
+set -u  # jangan -e / -o pipefail karena kita pakai pipe + while
+
+SCRIPT_NAME="$(basename "$0")"
+
+usage() {
+  cat <<EOF
+Smart Hi-Res → CD-quality converter
+
+Usage:
+  ${SCRIPT_NAME}
+  ${SCRIPT_NAME} IN_DIR
+  ${SCRIPT_NAME} IN_DIR OUT_DIR
+
+Arguments:
+  IN_DIR   Input directory to scan for audio files.
+           If omitted, current directory (.) is used.
+  OUT_DIR  Output directory for converted files.
+           If omitted, defaults to: IN_DIR/_CD_44k16bit
+
+Behavior:
+  - Non-recursive: only processes files directly under IN_DIR.
+  - Supported formats:
+      flac, wav, aiff, aif, m4a, alac
+  - For each file:
+      * If sample rate == 44100 Hz AND bit depth == 16:
+          - The file is copied as FLAC to OUT_DIR (no re-encode).
+      * Otherwise:
+          - The file is converted to 44.1 kHz, 16-bit FLAC using:
+              - High-quality SoXr resampling
+              - Shibata dither
+  - Global progress:
+      - Based on total duration of all files combined (in seconds).
+
+Requirements:
+  - ffprobe
+  - ffmpeg
+
+Examples:
+  ${SCRIPT_NAME}
+  ${SCRIPT_NAME} "/path/to/hires"
+  ${SCRIPT_NAME} "/path/to/hires" "/path/to/output_cd"
+EOF
+}
+
+require_cmd() {
+  local cmd="$1"
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "Error: required command '${cmd}' not found in PATH." >&2
+    exit 1
+  fi
+}
+
+# ---------- Argument parsing ----------
+
+IN_DIR="."
+OUT_DIR=""
+
+if (( $# > 0 )); then
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      IN_DIR="$1"
+      ;;
+  esac
+fi
+
+if (( $# > 1 )); then
+  OUT_DIR="$2"
+else
+  OUT_DIR="${IN_DIR%/}/_CD_44k16bit"
+fi
+
+if [[ ! -d "$IN_DIR" ]]; then
+  echo "❌ Error: input directory '${IN_DIR}' does not exist or is not a directory." >&2
+  exit 1
+fi
+
+# ---------- Dependency checks ----------
+
+require_cmd ffprobe
+require_cmd ffmpeg
+require_cmd find
+
+mkdir -p "$OUT_DIR"
+
+echo "🔄 Scan   : $IN_DIR"
+echo "📦 Output : $OUT_DIR"
+echo "--------------------------------"
+
+# ---------- helper ----------
+is_integer() {
+  # return 0 kalau isinya integer positif (0–9)
+  [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+to_int_seconds() {
+  # terima float seperti "123.456" → output "123"
+  local v="$1"
+  v="${v%%.*}"
+  if ! is_integer "$v"; then
+    echo "0"
+  else
+    echo "$v"
+  fi
+}
+
+to_int_bits() {
+  # bits_per_sample kadang "0" / kosong / N/A → anggap 0
+  local v="$1"
+  v="${v%%.*}"
+  if ! is_integer "$v"; then
+    echo "0"
+  else
+    echo "$v"
+  fi
+}
+
+# ---------- 1) kumpulkan file ----------
+files=()
+for ext in flac wav aiff aif m4a alac; do
+  while IFS= read -r -d '' f; do
+    files+=("$f")
+  done < <(find "$IN_DIR" -maxdepth 1 -type f -iname "*.${ext}" -print0)
+done
+
+if [ ${#files[@]} -eq 0 ]; then
+  echo "❌ Tidak ada file audio (flac/wav/aiff/aif/m4a/alac) di: $IN_DIR"
+  exit 1
+fi
+
+# ---------- 2) hitung total durasi ----------
+TOTAL_SECS=0
+for f in "${files[@]}"; do
+  dur_raw=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$f" || echo "0")
+  dur=$(to_int_seconds "$dur_raw")
+  TOTAL_SECS=$((TOTAL_SECS + dur))
+done
+
+if [ "$TOTAL_SECS" -le 0 ]; then
+  echo "⚠️  Total durasi terdeteksi 0 detik. Progress bar global akan dinonaktifkan."
+fi
+
+echo "🕒 Total durasi: ${TOTAL_SECS}s"
+echo "--------------------------------"
+
+DONE_SECS=0
+
+# ---------- 3) fungsi konversi ----------
+convert_one() {
+  local in_file="$1"
+  local base out_file cur_sr_raw cur_sr cur_bits_raw cur_bits \
+        file_dur_raw file_dur
+
+  base="$(basename "$in_file")"
+  out_file="${OUT_DIR}/${base%.*}.flac"
+
+  # ambil info audio
+  cur_sr_raw=$(ffprobe -v error -select_streams a:0 \
+    -show_entries stream=sample_rate -of csv=p=0 "$in_file" || echo "0")
+  cur_sr="$cur_sr_raw"
+
+  cur_bits_raw=$(ffprobe -v error -select_streams a:0 \
+    -show_entries stream=bits_per_sample -of csv=p=0 "$in_file" || echo "0")
+  cur_bits=$(to_int_bits "$cur_bits_raw")
+
+  file_dur_raw=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$in_file" || echo "0")
+  file_dur=$(to_int_seconds "$file_dur_raw")
+
+  echo "🎧 $base (sr=${cur_sr}Hz, bits=${cur_bits})"
+
+  # ✅ VALIDASI: kalau sudah 44.1 kHz dan 16-bit → SKIP re-encode (copy saja)
+  if [ "$cur_sr" = "44100" ] && [ "$cur_bits" = "16" ]; then
+    echo "   ⚡ Skip: sudah 44.1 kHz / 16-bit → copy saja"
+    cp -p "$in_file" "$out_file"
+
+    DONE_SECS=$((DONE_SECS + file_dur))
+
+    if [ "$TOTAL_SECS" -gt 0 ]; then
+      local percent=$(( DONE_SECS * 100 / TOTAL_SECS ))
+      echo "   ▶️  Overall progress: ${percent}%"
+    else
+      echo "   ▶️  Overall progress: (tidak tersedia)"
+    fi
+
+    echo "✅ Copied: $out_file"
+    echo "--------------------------------"
+    return
+  fi
+
+  # 🔁 convert ke 44.1k / 16bit FLAC
+  ffmpeg -hide_banner -loglevel error -y -i "$in_file" \
+    -af "aresample=resampler=soxr:precision=28:dither_method=shibata" \
+    -ar 44100 -sample_fmt s16 \
+    -map_metadata 0 -map 0:a -vn \
+    -c:a flac \
+    -progress - -nostats "$out_file" 2>/dev/null | \
+  while IFS='=' read -r key value; do
+    if [ "$key" = "out_time_ms" ] && [ "$TOTAL_SECS" -gt 0 ]; then
+      # ffmpeg kadang output: out_time_ms=N/A → harus di-skip
+      if ! is_integer "$value"; then
+        continue
+      fi
+
+      local cur_ms cur_secs global_done percent
+      cur_ms="${value%%.*}"
+      cur_secs=$((cur_ms / 1000))
+      global_done=$((DONE_SECS + cur_secs))
+
+      if [ "$global_done" -gt "$TOTAL_SECS" ]; then
+        global_done=$TOTAL_SECS
+      fi
+
+      percent=$(( global_done * 100 / TOTAL_SECS ))
+      echo -ne "   ▶️  Overall progress: ${percent}%\r"
+    fi
+  done
+
+  DONE_SECS=$((DONE_SECS + file_dur))
+
+  if [ "$TOTAL_SECS" -gt 0 ]; then
+    local final_percent=$(( DONE_SECS * 100 / TOTAL_SECS ))
+    echo -ne "\r   ▶️  Overall progress: ${final_percent}%\n"
+  else
+    echo "   ▶️  Overall progress: (tidak tersedia)"
+  fi
+
+  echo "✅ Done: $out_file"
+  echo "--------------------------------"
+}
+
+# ---------- 4) proses semua file ----------
+for f in "${files[@]}"; do
+  convert_one "$f"
+done
+
+echo "🎉 Selesai!"
+echo "📁 Lihat di: $OUT_DIR"
+

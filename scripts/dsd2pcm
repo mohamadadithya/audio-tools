@@ -1,0 +1,285 @@
+#!/usr/bin/env bash
+#
+# dsd2pcm.sh
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025 Mohamad Adithya
+#
+# High-quality DSD → PCM converter with:
+#   - Fixed output sample rate (default: 176.4 kHz)
+#   - Headroom-aware gain compensation
+#   - SoXR resampling + triangular dither
+#   - Optional ultrasonic low-pass filter
+#   - Optional limiter (~ -1 dBFS)
+#
+# Input : .dsf / .dff (DSD)
+# Output: FLAC or WAV (PCM)
+#
+
+set -euo pipefail
+
+# ===== Defaults (editable) =====
+SR=176400          # Output sample rate (Hz)
+TARGET_GAIN=6.0    # dB (target boost / DSD headroom compensation)
+SAFETY=1.0         # dB (true-peak safety margin from 0 dBFS)
+LPF=50000          # Hz (low-pass to tame ultrasonic noise)
+FORMAT="flac"      # flac | wav
+RECURSIVE=false    # process subfolders and mirror structure
+LIMITER=false      # add limiter (~ -1 dBFS)
+IN_DIR="."
+OUT_DIR="./out_flac_176k"
+# ==============================
+
+SCRIPT_NAME="$(basename "$0")"
+
+print_help() {
+  cat <<EOF
+High-quality DSD → PCM converter (DSF/DFF → FLAC/WAV)
+
+Usage:
+  ${SCRIPT_NAME} [options]
+
+Options:
+  -i DIR   Input directory
+           Default: ${IN_DIR}
+  -o DIR   Output directory
+           Default: ${OUT_DIR}
+  -r SR    Output sample rate in Hz
+           Default: ${SR}
+  -g dB    Target gain (desired max boost)
+           Default: ${TARGET_GAIN} dB
+  -s dB    Safety margin below 0 dBFS
+           Default: ${SAFETY} dB
+  -p Hz    Low-pass cutoff frequency
+           Default: ${LPF} Hz
+  -f fmt   Output format: flac | wav
+           Default: ${FORMAT}
+  -R       Recursive mode (process subfolders, mirror structure under OUT_DIR)
+  -L       Enable limiter (alimiter ≈ -1 dBFS)
+  -h       Show this help message and exit
+
+Behavior:
+  - Input:  .dsf / .dff (DSD)
+  - Output: PCM FLAC (32-bit float encoded as FLAC, default) or 24-bit WAV
+  - Per-file pipeline:
+      * Convert DSD → PCM
+      * Apply low-pass at LPF Hz
+      * Analyze peak level (volumedetect)
+      * Compute safe gain from:
+          - Target gain (TARGET_GAIN)
+          - Measured headroom
+          - Safety margin (SAFETY)
+      * Apply gain, resampling, dither, optional limiter
+  - Logging:
+      * A text log is written to: OUT_DIR/info.txt
+
+Examples:
+  # Basic conversion (defaults: 176.4k, FLAC)
+  ${SCRIPT_NAME} -i "DSD" -o "PCM_176k"
+
+  # 88.2k output, 40 kHz low-pass, enable limiter
+  ${SCRIPT_NAME} -i "DSD" -o "PCM_88k" -r 88200 -p 40000 -L
+
+  # WAV output, recursive, slightly lower gain target
+  ${SCRIPT_NAME} -i "DSD" -o "PCM_WAV" -f wav -R -g 4.0
+EOF
+}
+
+# ---------- Argument parsing ----------
+while getopts ":i:o:r:g:s:p:f:RLh" opt; do
+  case "$opt" in
+    i) IN_DIR="$OPTARG" ;;
+    o) OUT_DIR="$OPTARG" ;;
+    r) SR="$OPTARG" ;;
+    g) TARGET_GAIN="$OPTARG" ;;
+    s) SAFETY="$OPTARG" ;;
+    p) LPF="$OPTARG" ;;
+    f) FORMAT="$OPTARG" ;;
+    R) RECURSIVE=true ;;
+    L) LIMITER=true ;;
+    h) print_help; exit 0 ;;
+    :) echo "Option -$OPTARG requires a value" >&2; exit 1 ;;
+    \?) echo "Unknown option -$OPTARG" >&2; print_help; exit 1 ;;
+  esac
+done
+
+# ---------- Dependency / sanity checks ----------
+command -v ffmpeg >/dev/null 2>&1 || { echo "ffmpeg not found" >&2; exit 1; }
+[[ "$FORMAT" == "flac" || "$FORMAT" == "wav" ]] || { echo "FORMAT must be flac|wav" >&2; exit 1; }
+[[ -d "$IN_DIR" ]] || { echo "Input dir not found: $IN_DIR" >&2; exit 1; }
+mkdir -p "$OUT_DIR"
+
+echo "Input   : $IN_DIR"
+echo "Output  : $OUT_DIR"
+echo "SR      : $SR Hz"
+echo "TARGET_GAIN = +$TARGET_GAIN dB"
+echo "SAFETY      = $SAFETY dB"
+echo "LPF         = $LPF Hz"
+echo "FORMAT      = $FORMAT"
+echo "Recursive   = $RECURSIVE"
+echo "Limiter     = $LIMITER"
+echo
+
+INFO_FILE="$OUT_DIR/info.txt"
+{
+  echo "=== DSD → PCM Conversion Info ==="
+  echo "Sample Rate : $SR Hz"
+  echo "Target Gain : +$TARGET_GAIN dB"
+  echo "Safety      : $SAFETY dB"
+  echo "Low-Pass    : $LPF Hz"
+  echo "Format      : $FORMAT"
+  echo "Recursive   : $RECURSIVE"
+  echo "Limiter     : $LIMITER"
+  echo "Output Dir  : $OUT_DIR"
+  echo "Date Start  : $(date)"
+  echo
+} >"$INFO_FILE"
+
+# ---------- Helpers ----------
+mk_out_path() {
+  local in="$1" rel stem ext
+  [[ "$FORMAT" == "flac" ]] && ext="flac" || ext="wav"
+
+  if $RECURSIVE; then
+    rel="${in#$IN_DIR/}"
+    stem="${rel%.*}"
+    mkdir -p "$OUT_DIR/$(dirname "$stem")"
+    echo "$OUT_DIR/${stem}.${ext}"
+  else
+    stem="$(basename "${in%.*}")"
+    echo "$OUT_DIR/${stem}.${ext}"
+  fi
+}
+
+extract_maxvol() {
+  awk '/max_volume:/{print}' "$1" \
+  | tail -n1 \
+  | sed -E 's/.*max_volume:[[:space:]]*([-]?[0-9]+(\.[0-9]+)?)[[:space:]]*dB.*/\1/' \
+  | tr -d '\r'
+}
+
+analyze_peak() {
+  local in="$1" log mv
+  log="$(mktemp)"
+  ffmpeg -nostdin -hide_banner -nostats -y \
+    -i "$in" -ar "$SR" \
+    -af "lowpass=f=${LPF},aresample=resampler=soxr:dither_method=triangular,volumedetect" \
+    -f null - 1>/dev/null 2>"$log" || true
+
+  mv="$(extract_maxvol "$log" || true)"
+  rm -f "$log"
+
+  [[ -z "$mv" || "$mv" == "-inf" || "$mv" == "nan" ]] && echo "" || echo "$mv"
+}
+
+calc_safe_gain() {
+  # mv = max_volume (dB), t = TARGET_GAIN, s = SAFETY
+  awk -v mv="$1" -v t="$2" -v s="$3" 'BEGIN{
+    hr = -mv; if (hr < 0) hr = 0;
+    g  = hr - s; if (g < 0) g = 0;
+    if (g > t) g = t;
+    printf "%.3f", g;
+  }'
+}
+
+build_filter_chain() {
+  local g="$1"
+  local chain="lowpass=f=${LPF},volume=${g}dB,aresample=resampler=soxr:dither_method=triangular"
+  $LIMITER && chain="${chain},alimiter=limit=0.891"
+  echo "$chain"
+}
+
+# ---------- Progress bar ----------
+draw_progress() {
+  # args: current total
+  local cur="$1" total="$2" width=38
+  if [ "$total" -le 0 ]; then total=1; fi
+  local pct=$(( cur * 100 / total ))
+  local fill=$(( cur * width / total ))
+  local empty=$(( width - fill ))
+  printf "\r[%s%s] %3d%%  (%d/%d)" \
+    "$(printf "%${fill}s" | tr ' ' '#')" \
+    "$(printf "%${empty}s" | tr ' ' '.')" \
+    "$pct" "$cur" "$total"
+  if [ "$cur" -eq "$total" ]; then printf "\n"; fi
+}
+
+# ---------- Enumerate files & count total (NUL-safe) ----------
+if $RECURSIVE; then
+  FIND_LIMIT=""
+else
+  FIND_LIMIT="-maxdepth 1"
+fi
+
+TOTAL=$(
+  find "$IN_DIR" $FIND_LIMIT -type f \( -iname "*.dsf" -o -iname "*.dff" \) -print0 \
+    | tr -cd '\0' | wc -c | tr -d '[:space:]'
+)
+
+if [ "$TOTAL" -eq 0 ]; then
+  echo "⚠️  No .dsf/.dff files found in '$IN_DIR'"
+  exit 0
+fi
+
+echo "Tracks detected: $TOTAL"
+COUNT=0
+draw_progress "$COUNT" "$TOTAL"
+
+# ---------- Process loop (NUL-terminated; safe for spaces) ----------
+if $RECURSIVE; then
+  FIND_CMD=(find "$IN_DIR" -type f \( -iname "*.dsf" -o -iname "*.dff" \) -print0)
+else
+  FIND_CMD=(find "$IN_DIR" -maxdepth 1 -type f \( -iname "*.dsf" -o -iname "*.dff" \) -print0)
+fi
+
+while IFS= read -r -d '' in_file; do
+  base="$(basename "$in_file")"
+  out_file="$(mk_out_path "$in_file")"
+
+  # -- Analyze peak / headroom
+  mv_val="$(analyze_peak "$in_file")"
+  if [[ -z "$mv_val" ]]; then
+    safe="$TARGET_GAIN"
+    headroom="unknown"
+  else
+    headroom="$(awk -v m="$mv_val" 'BEGIN{h=-m; if (h<0) h=0; printf "%.3f", h}')"
+    safe="$(calc_safe_gain "$mv_val" "$TARGET_GAIN" "$SAFETY")"
+  fi
+
+  # -- Build filter chain & convert
+  filters="$(build_filter_chain "$safe")"
+
+  if [[ "$FORMAT" == "flac" ]]; then
+    ffmpeg -nostdin -hide_banner -nostats -y \
+      -i "$in_file" \
+      -ar "$SR" \
+      -af "$filters" \
+      -sample_fmt s32 \
+      -c:a flac -compression_level 8 \
+      "$out_file"
+  else
+    ffmpeg -nostdin -hide_banner -nostats -y \
+      -i "$in_file" \
+      -ar "$SR" \
+      -af "$filters" \
+      -c:a pcm_s24le \
+      "$out_file"
+  fi
+
+  # -- Per-file log
+  echo "$base → Peak:${mv_val:-unknown} dB | Headroom:${headroom} dB | Gain:+${safe} dB | Out:${out_file#$OUT_DIR/}" >>"$INFO_FILE"
+
+  # -- Progress update
+  COUNT=$(( COUNT + 1 ))
+  draw_progress "$COUNT" "$TOTAL"
+done < <("${FIND_CMD[@]}")
+
+{
+  echo
+  echo "Date Finish : $(date)"
+  echo "Total Tracks: $TOTAL"
+} >>"$INFO_FILE"
+
+echo
+echo "✅ Done. Files saved in: $OUT_DIR"
+echo "ℹ️  Details logged in: $INFO_FILE"
+

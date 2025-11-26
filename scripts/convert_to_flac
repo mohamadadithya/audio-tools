@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+#
+# convert_to_flac.sh
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025 Mohamad Adithya
+#
+# Convert various lossless formats → FLAC (non-recursive) without quality loss.
+#
+# Features:
+#   - Preserves metadata (title, artist, album, replaygain, etc.)
+#   - Preserves cover art / album art (attached picture)
+#   - Does NOT change sample rate / channels / bit depth
+#   - Skips conversion if:
+#       - Input is already .flac
+#       - Output file already exists
+#
+# Usage:
+#   convert_to_flac.sh                  → source = .,        output = ./FLAC
+#   convert_to_flac.sh SRC              → source = SRC,      output = SRC/FLAC
+#   convert_to_flac.sh SRC OUT          → source = SRC,      output = OUT (relative to SRC)
+#
+
+set -euo pipefail
+shopt -s nullglob
+
+SCRIPT_NAME="$(basename "$0")"
+
+usage() {
+  cat <<EOF
+Lossless-to-FLAC converter (non-recursive, quality-preserving)
+
+Usage:
+  ${SCRIPT_NAME}
+  ${SCRIPT_NAME} SRC_DIR
+  ${SCRIPT_NAME} SRC_DIR OUT_DIR
+
+If no arguments are provided:
+  - Source directory = current directory (.)
+  - Output directory = ./FLAC
+
+If only SRC_DIR is provided:
+  - Script will cd into SRC_DIR
+  - Output directory = SRC_DIR/FLAC
+
+If SRC_DIR and OUT_DIR are provided:
+  - Script will cd into SRC_DIR
+  - Output directory = OUT_DIR (relative to SRC_DIR unless absolute)
+
+Behavior:
+  - Non-recursive: only processes files in the current (source) directory.
+  - Converts supported lossless formats to FLAC:
+      wav, aif, aiff, m4a, alac, ape, wv, tta, flac
+  - Skips files that:
+      - Are already FLAC
+      - Already have an existing FLAC output file
+  - Preserves:
+      - All metadata (using -map_metadata 0)
+      - Chapters (using -map_chapters 0)
+      - Cover art / attached pictures (via -map 0 and -c:v copy)
+
+Requirements:
+  - ffmpeg
+
+Examples:
+  ${SCRIPT_NAME}
+  ${SCRIPT_NAME} "/path/to/lossless"
+  ${SCRIPT_NAME} "/path/to/lossless" "FLAC"
+  ${SCRIPT_NAME} "/path/to/lossless" "/another/path/FLAC"
+EOF
+}
+
+require_cmd() {
+  local cmd="$1"
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "Error: required command '${cmd}' not found in PATH." >&2
+    exit 1
+  fi
+}
+
+# ---------- Argument parsing ----------
+
+SRC_DIR="."
+OUT_DIR=""
+
+if (( $# > 0 )); then
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      SRC_DIR="$1"
+      ;;
+  esac
+fi
+
+if (( $# > 1 )); then
+  OUT_DIR="$2"
+else
+  OUT_DIR="${SRC_DIR%/}/FLAC"
+fi
+
+if [[ ! -d "$SRC_DIR" ]]; then
+  echo "Error: source directory '${SRC_DIR}' does not exist or is not a directory." >&2
+  exit 1
+fi
+
+# ---------- Dependency checks ----------
+
+require_cmd ffmpeg
+
+# ---------- Main logic ----------
+
+# Move into source directory (all paths below are relative to this)
+cd "$SRC_DIR"
+
+echo "Source dir : $(pwd)"
+echo "Output dir : $OUT_DIR"
+echo "Scanning lossless files (non-recursive)..."
+
+mkdir -p "$OUT_DIR"
+
+# Collect lossless files in this directory only (no subdirectories)
+FILES=()
+EXTS=(wav WAV aif AIF aiff AIFF m4a M4A alac ALAC ape APE wv WV tta TTA flac FLAC)
+
+for ext in "${EXTS[@]}"; do
+  FILES+=( *."$ext" )
+done
+
+TOTAL=${#FILES[@]}
+
+if (( TOTAL == 0 )); then
+  echo "No lossless files found in this directory."
+  exit 0
+fi
+
+echo "Total files found : $TOTAL"
+echo
+
+i=0
+
+for in_file in "${FILES[@]}"; do
+  (( i++ ))
+
+  rel_path="$in_file"
+  ext="${in_file##*.}"
+  ext_lower=$(printf '%s' "$ext" | tr 'A-Z' 'a-z')
+  percent=$(( i * 100 / TOTAL ))
+
+  # Skip if already FLAC
+  if [[ "$ext_lower" == "flac" ]]; then
+    printf '[%d/%d] %3d%% SKIP  (already FLAC)         : %s\n' "$i" "$TOTAL" "$percent" "$rel_path"
+    continue
+  fi
+
+  # Output name inside OUT_DIR, no subdir structure (non-recursive)
+  base_noext="${in_file%.*}"
+  out_file="$OUT_DIR/${base_noext}.flac"
+  out_dir="$(dirname "$out_file")"
+  mkdir -p "$out_dir"
+
+  if [[ -f "$out_file" ]]; then
+    printf '[%d/%d] %3d%% SKIP  (output exists)        : %s\n' "$i" "$TOTAL" "$percent" "$rel_path"
+    continue
+  fi
+
+  printf '[%d/%d] %3d%% CONVERT                      : %s\n' "$i" "$TOTAL" "$percent" "$rel_path"
+
+  # 🔊 Convert lossless → FLAC without quality loss:
+  # - map 0         → copy all streams (audio, cover art, etc.)
+  # - map_metadata 0 → preserve all tags
+  # - map_chapters 0 → preserve chapters (if present)
+  # - c:a flac -compression_level 8 → lossless FLAC with good compression
+  # - c:v copy      → keep embedded cover art as-is
+  ffmpeg -hide_banner -loglevel error \
+    -i "$in_file" \
+    -map_metadata 0 \
+    -map_chapters 0 \
+    -map 0 \
+    -c:a flac -compression_level 8 \
+    -c:v copy \
+    "$out_file" || {
+      echo "FAILED to convert: $rel_path" >&2
+    }
+
+done
+
+echo
+echo "Done ✅ (lossless conversion, metadata & cover art preserved when present)"
+

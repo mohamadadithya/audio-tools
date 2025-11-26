@@ -1,0 +1,460 @@
+#!/usr/bin/env bash
+#
+# downsample_flac.sh
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025 Mohamad Adithya
+#
+# High-Quality Downsample + Gain Normalize (PCM FLAC/WAV)
+#
+# - Input : FLAC / WAV
+# - Output: Target sample rate, 24-bit (FLAC/WAV)
+# - Gain  : album-wide OR per-track, based on "max_volume"
+# - Resampler: SoXR, high precision, triangular dither
+#
+
+set -euo pipefail
+
+# ======================================================
+# Default Settings (can be overridden via CLI options)
+# ======================================================
+TARGET_SR=""            # Required: target sample rate (Hz), e.g. 44100 / 48000 / 88200
+IN_DIR="."
+OUT_DIR="./converted"
+GAIN_MODE="album"       # album | track
+MAX_GAIN=8.0            # dB, maximum allowed boost
+SAFETY=1.0              # dB, safety margin from 0 dBFS (anti clipping)
+FORMAT="auto"           # auto | flac | wav (auto = follow input extension)
+RECURSIVE=false         # true = process subfolders & mirror structure
+ALLOW_UPSAMPLING=false  # true = allow upsampling, false = skip when target > source
+LPF=0                   # Hz; 0 = no low-pass filter
+LIMITER=false           # true = enable alimiter at ~ -1 dBFS
+DRY_RUN=false           # true = print planned commands, do not run ffmpeg
+
+INFO_FILE=""            # set after OUT_DIR is known
+# ======================================================
+
+SCRIPT_NAME="$(basename "$0")"
+
+print_help() {
+  cat <<EOF
+downsample_flac – High-Quality Downsample + Normalize for PCM FLAC/WAV
+
+Usage:
+  ${SCRIPT_NAME} -r <target_sample_rate> [options]
+
+Required:
+  -r SR      Target sample rate in Hz (e.g. 44100, 48000, 88200)
+
+Options:
+  -i DIR     Input directory (default: ${IN_DIR})
+  -o DIR     Output directory (default: ${OUT_DIR})
+  -m MODE    Gain mode: album | track (default: ${GAIN_MODE})
+             - album: one gain value for all tracks (based on album max_volume)
+             - track: per-track gain based on each file's max_volume
+  -g dB      Maximum allowed gain boost (cap) in dB (default: ${MAX_GAIN})
+  -s dB      Safety margin below 0 dBFS in dB (default: ${SAFETY})
+  -f fmt     Output format: auto | flac | wav (default: ${FORMAT})
+             - auto: follow input extension (flac→flac, wav→wav, else→flac)
+  -p Hz      Low-pass cutoff frequency (0 = disabled, default: ${LPF})
+  -R         Recursive mode (mirror subfolder structure under OUT_DIR)
+  -U         Allow upsampling (by default, files with source SR < target SR are skipped)
+  -L         Enable limiter (alimiter, approx -1 dBFS peak)
+  -n         Dry run (only print ffmpeg commands, do not execute)
+  -h         Show this help message and exit
+
+Behavior:
+  - Input formats: FLAC / WAV / WAVE
+  - Output:
+      * 24-bit FLAC (with -compression_level 12) when output format is FLAC
+      * 24-bit PCM WAV when output format is WAV
+  - Gain:
+      * Uses ffmpeg volumedetect to read max_volume
+      * Computes safe gain (0..MAX_GAIN dB), with SAFETY margin from 0 dBFS
+  - Resampling:
+      * SoXR resampler, high precision
+      * Triangular dither
+      * All output forced to TARGET_SR
+  - Metadata:
+      * Copies all metadata and chapters
+      * Copies attached pictures (album art) via -c:v copy and attached_pic disposition
+
+Examples:
+  # Downsample 88.2k / 176.4k → 44.1k with album-wide gain:
+  ${SCRIPT_NAME} -r 44100 -i "PCM_from_DSD" -o "converted_44"
+
+  # Track-based gain, low-pass at 40 kHz, limiter enabled:
+  ${SCRIPT_NAME} -r 44100 -i in -o out -m track -p 40000 -L
+
+EOF
+}
+
+# -------- Argument parsing --------
+while getopts ":r:i:o:m:g:s:f:p:RULnh" opt; do
+  case "$opt" in
+    r) TARGET_SR="$OPTARG" ;;
+    i) IN_DIR="$OPTARG" ;;
+    o) OUT_DIR="$OPTARG" ;;
+    m) GAIN_MODE="$OPTARG" ;;
+    g) MAX_GAIN="$OPTARG" ;;
+    s) SAFETY="$OPTARG" ;;
+    f) FORMAT="$OPTARG" ;;
+    p) LPF="$OPTARG" ;;
+    R) RECURSIVE=true ;;
+    U) ALLOW_UPSAMPLING=true ;;
+    L) LIMITER=true ;;
+    n) DRY_RUN=true ;;
+    h) print_help; exit 0 ;;
+    :) echo "Option -$OPTARG requires a value" >&2; exit 1 ;;
+    \?) echo "Unknown option -$OPTARG" >&2; print_help; exit 1 ;;
+  esac
+done
+
+if [[ -z "$TARGET_SR" ]]; then
+  echo "ERROR: -r <target_sample_rate> is required." >&2
+  print_help
+  exit 1
+fi
+
+if [[ "$GAIN_MODE" != "album" && "$GAIN_MODE" != "track" ]]; then
+  echo "ERROR: GAIN_MODE must be 'album' or 'track' (got: $GAIN_MODE)" >&2
+  exit 1
+fi
+
+if ! command -v ffmpeg >/dev/null 2>&1; then
+  echo "ffmpeg not found in PATH" >&2
+  exit 1
+fi
+
+if ! command -v ffprobe >/dev/null 2>&1; then
+  echo "ffprobe not found in PATH" >&2
+  exit 1
+fi
+
+if [[ ! -d "$IN_DIR" ]]; then
+  echo "Input dir not found: $IN_DIR" >&2
+  exit 1
+fi
+
+# Normalize paths: strip trailing slash
+IN_DIR="${IN_DIR%/}"
+OUT_DIR="${OUT_DIR%/}"
+
+mkdir -p "$OUT_DIR"
+INFO_FILE="$OUT_DIR/info.txt"
+
+# -------- Helpers --------
+
+log_info() {
+  echo "$*" >>"$INFO_FILE"
+}
+
+bool_text() {
+  local v="$1"
+  if [[ "$v" == "true" ]]; then
+    echo "YES"
+  else
+    echo "NO"
+  fi
+}
+
+mk_out_path() {
+  local in="$1"
+  local rel stem ext out_ext base_fmt
+
+  base_fmt="$FORMAT"
+
+  # Determine output extension
+  if [[ "$base_fmt" = "auto" ]]; then
+    ext="${in##*.}"
+    ext=$(printf '%s' "$ext" | tr '[:upper:]' '[:lower:]')
+    case "$ext" in
+      flac) out_ext="flac" ;;
+      wav|wave) out_ext="wav" ;;
+      *) out_ext="flac" ;;  # fallback
+    esac
+  else
+    if [[ "$base_fmt" = "flac" ]]; then
+      out_ext="flac"
+    else
+      out_ext="wav"
+    fi
+  fi
+
+  if $RECURSIVE; then
+    # Mirror input folder structure under OUT_DIR
+    rel="${in#$IN_DIR/}"
+    stem="${rel%.*}"
+    mkdir -p "$OUT_DIR/$(dirname "$stem")"
+    printf '%s\n' "$OUT_DIR/${stem}.${out_ext}"
+  else
+    stem="$(basename "${in%.*}")"
+    printf '%s\n' "$OUT_DIR/${stem}.${out_ext}"
+  fi
+}
+
+extract_maxvol() {
+  local logfile="$1"
+  awk '/max_volume:/{print}' "$logfile" \
+  | tail -n1 \
+  | sed -E 's/.*max_volume:[[:space:]]*([-]?[0-9]+(\.[0-9]+)?)[[:space:]]*dB.*/\1/' \
+  | tr -d '\r'
+}
+
+analyze_peak() {
+  local in="$1"
+  local log mv
+  log="$(mktemp)"
+  ffmpeg -nostdin -hide_banner -nostats -y \
+    -i "$in" \
+    -af "volumedetect" \
+    -f null - 1>/dev/null 2>"$log" || true
+
+  mv="$(extract_maxvol "$log" || true)"
+  rm -f "$log"
+
+  if [[ -z "$mv" || "$mv" = "-inf" || "$mv" = "nan" ]]; then
+    echo ""
+  else
+    echo "$mv"
+  fi
+}
+
+calc_safe_gain() {
+  # mv = max_volume (dB, negative), t = MAX_GAIN, s = SAFETY
+  local mv="$1"
+  local t="$2"
+  local s="$3"
+  awk -v mv="$mv" -v t="$t" -v s="$s" 'BEGIN{
+    hr = -mv;
+    if (hr < 0) hr = 0;
+    g = hr - s;
+    if (g < 0) g = 0;
+    if (g > t) g = t;
+    printf "%.3f", g;
+  }'
+}
+
+get_sample_rate() {
+  local in="$1"
+  local val
+  val=$(ffprobe -v error -select_streams a:0 \
+    -show_entries stream=sample_rate \
+    -of csv=p=0 "$in" | head -1 | tr -d '\r\n')
+
+  # Remove non-digit chars (commas, spaces, etc.)
+  val="${val//[^0-9]/}"
+
+  echo "$val"
+}
+
+build_af_chain() {
+  local gain_db="$1"
+  local chain=""
+
+  # LPF if enabled
+  if (( LPF > 0 )); then
+    chain="lowpass=f=${LPF},"
+  fi
+
+  # Gain
+  chain="${chain}volume=${gain_db}dB"
+
+  # Resample – always force TARGET_SR for consistency
+  chain="${chain},aresample=${TARGET_SR}:resampler=soxr:precision=33:dither_method=triangular"
+
+  # Limiter if enabled
+  if $LIMITER; then
+    chain="${chain},alimiter=limit=0.891"
+  fi
+
+  printf '%s\n' "$chain"
+}
+
+build_codec_args() {
+  local out_file="$1"
+  local ext
+  ext="${out_file##*.}"
+  ext=$(printf '%s' "$ext" | tr '[:upper:]' '[:lower:]')
+
+  # -ar TARGET_SR to force output sample rate
+  if [[ "$ext" = "flac" ]]; then
+    printf '%s\n' "-c:a flac -compression_level 12 -sample_fmt s32 -bits_per_raw_sample 24 -ar ${TARGET_SR}"
+  else
+    printf '%s\n' "-c:a pcm_s24le -ar ${TARGET_SR}"
+  fi
+}
+
+# -------- Header info --------
+
+echo "Input Dir : $IN_DIR"
+echo "Output Dir: $OUT_DIR"
+echo "Target SR : $TARGET_SR Hz"
+echo "Gain mode : $GAIN_MODE"
+echo "Max gain  : $MAX_GAIN dB"
+echo "Safety    : $SAFETY dB"
+echo "Format    : $FORMAT"
+echo "LPF       : $LPF Hz (0 = off)"
+echo "Recursive : $(bool_text "$RECURSIVE")"
+echo "Upsampling: $(bool_text "$ALLOW_UPSAMPLING")"
+echo "Limiter   : $(bool_text "$LIMITER")"
+echo "Dry run   : $(bool_text "$DRY_RUN")"
+echo
+
+{
+  echo "=== HQ Downsample + Normalize ==="
+  echo "Target SR   : $TARGET_SR Hz"
+  echo "Gain mode   : $GAIN_MODE"
+  echo "Max Gain    : $MAX_GAIN dB"
+  echo "Safety      : $SAFETY dB"
+  echo "LPF         : $LPF Hz"
+  echo "Format      : $FORMAT"
+  echo "Recursive   : $RECURSIVE"
+  echo "Upsampling  : $ALLOW_UPSAMPLING"
+  echo "Limiter     : $LIMITER"
+  echo "Dry run     : $DRY_RUN"
+  echo "Input Dir   : $IN_DIR"
+  echo "Output Dir  : $OUT_DIR"
+  echo "Date Start  : $(date)"
+  echo
+} >"$INFO_FILE"
+
+# -------- Collect files --------
+
+FILES=()
+
+if $RECURSIVE; then
+  while IFS= read -r -d '' f; do
+    FILES+=("$f")
+  done < <(find "$IN_DIR" -type f \( -iname "*.flac" -o -iname "*.wav" -o -iname "*.wave" \) -print0)
+else
+  while IFS= read -r -d '' f; do
+    FILES+=("$f")
+  done < <(find "$IN_DIR" -maxdepth 1 -type f \( -iname "*.flac" -o -iname "*.wav" -o -iname "*.wave" \) -print0)
+fi
+
+if [[ ${#FILES[@]} -eq 0 ]]; then
+  echo "⚠️  No FLAC/WAV files found in '$IN_DIR'"
+  exit 0
+fi
+
+echo "Tracks detected: ${#FILES[@]}"
+echo
+
+# -------- Pass 1: Album gain (if album mode) --------
+
+album_max=""
+album_gain_db="0.000"
+
+if [[ "$GAIN_MODE" = "album" ]]; then
+  for f in "${FILES[@]}"; do
+    mv_val="$(analyze_peak "$f")"
+    if [[ -z "$mv_val" ]]; then
+      continue
+    fi
+
+    if [[ -z "$album_max" ]]; then
+      album_max="$mv_val"
+    else
+      # pick max_volume closest to 0 dBFS (i.e., numerically largest)
+      if awk -v a="$mv_val" -v b="$album_max" 'BEGIN{exit !(a>b)}'; then
+        album_max="$mv_val"
+      fi
+    fi
+  done
+
+  if [[ -z "$album_max" ]]; then
+    echo "Failed to read album max_volume, gain will be 0 dB."
+    album_max="-9999"
+    album_gain_db="0.000"
+  else
+    album_gain_db="$(calc_safe_gain "$album_max" "$MAX_GAIN" "$SAFETY")"
+  fi
+
+  headroom_txt=$(awk -v mv="$album_max" 'BEGIN{
+    if (mv < -900) { print "unknown"; }
+    else {
+      hr = -mv; if (hr < 0) hr = 0;
+      printf "%.3f dB", hr;
+    }
+  }')
+
+  echo "Album max_volume : ${album_max} dBFS"
+  echo "Album headroom   : ${headroom_txt}"
+  echo "Album gain apply : +${album_gain_db} dB (uniform)"
+  echo
+
+  log_info "Album max_volume : ${album_max} dB"
+  log_info "Album headroom   : ${headroom_txt}"
+  log_info "Album gain       : +${album_gain_db} dB (album mode)"
+  log_info ""
+fi
+
+# -------- Pass 2: Process files --------
+
+idx=0
+total=${#FILES[@]}
+
+for f in "${FILES[@]}"; do
+  idx=$((idx + 1))
+
+  src_sr="$(get_sample_rate "$f")"
+
+  if [[ -z "$src_sr" ]]; then
+    echo "[$idx/$total] SKIP (SR unreadable): $f"
+    continue
+  fi
+
+  # Skip upsampling if not allowed
+  if (( TARGET_SR > src_sr )) && ! $ALLOW_UPSAMPLING; then
+    echo "[$idx/$total] SKIP upsampling (${src_sr} -> ${TARGET_SR}): $f"
+    continue
+  fi
+
+  out_file="$(mk_out_path "$f")"
+  mkdir -p "$(dirname "$out_file")"
+
+  # Compute gain
+  gain_db="0.000"
+  if [[ "$GAIN_MODE" = "album" ]]; then
+    gain_db="$album_gain_db"
+  else
+    mv_val2="$(analyze_peak "$f")"
+    if [[ -n "$mv_val2" ]]; then
+      gain_db="$(calc_safe_gain "$mv_val2" "$MAX_GAIN" "$SAFETY")"
+    fi
+  fi
+
+  af_chain="$(build_af_chain "$gain_db")"
+  codec_str="$(build_codec_args "$out_file")"
+
+  echo "[$idx/$total] ${src_sr} -> ${TARGET_SR} Hz | gain +${gain_db} dB | $(basename "$f")"
+
+  if $DRY_RUN; then
+    echo "[DRY] ffmpeg -i \"$f\" -map 0 -af \"$af_chain\" $codec_str -c:v copy -disposition:v:0 attached_pic -map_metadata 0 -map_chapters 0 \"$out_file\""
+    log_info "$(basename "$f") -> DRY RUN | Src SR: ${src_sr} | Gain: +${gain_db} dB | Out: ${out_file#$OUT_DIR/}"
+    continue
+  fi
+
+  # shellcheck disable=SC2086
+  ffmpeg -nostdin -hide_banner -nostats -y \
+    -i "$f" \
+    -map 0 \
+    -af "$af_chain" \
+    $codec_str \
+    -c:v copy -disposition:v:0 attached_pic \
+    -map_metadata 0 -map_chapters 0 \
+    "$out_file"
+
+  log_info "$(basename "$f") -> Out: ${out_file#$OUT_DIR/} | Src SR: ${src_sr} | Gain: +${gain_db} dB"
+done
+
+{
+  echo
+  echo "Date Finish : $(date)"
+  echo "Total Tracks: $total"
+} >>"$INFO_FILE"
+
+echo
+echo "✅ Done. Output directory: $OUT_DIR"
+echo "ℹ️ Details logged in   : $INFO_FILE"
+

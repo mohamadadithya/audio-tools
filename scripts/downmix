@@ -1,0 +1,226 @@
+#!/usr/bin/env zsh
+#
+# downmix_dolby_to_stereo.zsh
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025 Mohamad Adithya
+#
+# Downmix Dolby (E-AC-3 / AC-3 / E-AC-3 JOC bed) → Stereo
+#
+# Features:
+#   - Dialog-forward downmix matrix for Dolby codecs
+#   - Neutral downmix matrix for non-Dolby multichannel
+#   - No DRC applied (drc_scale=0)
+#   - Keeps:
+#       • Metadata
+#       • Chapters
+#       • Subtitles
+#       • Video streams
+#   - Output extension matches the source file
+#
+# Behavior:
+#   - Scans the current directory for common multichannel-capable formats:
+#       *.m4a, *.mp4, *.mkv, *.flac, *.wav, *.aac, *.alac  (case-insensitive)
+#   - If a file is already stereo → copies all streams as-is.
+#   - If a file is multichannel:
+#       • Detects codec via ffprobe
+#       • Uses dialog-forward matrix for AC-3 / E-AC-3
+#       • Uses neutral matrix for other codecs
+#       • Writes output to ./Stereo/<same-name-and-extension>
+#
+# Usage:
+#   downmix_dolby_to_stereo.zsh
+#
+# Options:
+#   -h, --help      Show this help message and exit
+#
+
+set -euo pipefail
+setopt NULL_GLOB
+
+SCRIPT_NAME="${0:t}"
+
+die()  { print -u2 "❌ $*"; exit 1; }
+info() { print "• $*"; }
+
+print_help() {
+  cat <<EOF
+Downmix Dolby (AC-3 / E-AC-3 / E-AC-3 JOC bed) to Stereo
+
+Usage:
+  ${SCRIPT_NAME}
+
+Behavior:
+  - Scans the current directory for files with extensions:
+      *.m4a, *.M4A
+      *.mp4, *.MP4
+      *.mkv, *.MKV
+      *.flac, *.FLAC
+      *.wav, *.WAV
+      *.aac, *.AAC
+      *.alac, *.ALAC
+  - Creates an output folder:
+      ./Stereo
+  - For each file:
+      * If audio is already 2ch (stereo):
+          - Copies all streams (audio, video, subs, metadata, chapters) unchanged.
+      * If multichannel:
+          - Uses a dialog-forward downmix matrix for Dolby (ac3 / eac3).
+          - Uses a neutral downmix matrix for others.
+          - Applies:
+              -dr c_scale 0   (disable Dolby DRC)
+              alimiter=limit=0.97 (light peak limiting)
+  - Output filenames and extensions match the source:
+      input: Movie.mkv  →  output: Stereo/Movie.mkv
+
+Examples:
+  ${SCRIPT_NAME}
+  (Run inside a folder containing multichannel files to be downmixed.)
+
+Requirements:
+  - ffmpeg
+  - ffprobe
+EOF
+}
+
+# Help shortcut
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  print_help
+  exit 0
+fi
+
+trap 'die "Terjadi error. Periksa log di atas."' ERR
+
+command -v ffmpeg  >/dev/null 2>&1 || die "ffmpeg tidak ditemukan di PATH."
+command -v ffprobe >/dev/null 2>&1 || die "ffprobe tidak ditemukan di PATH."
+
+# helper: cek integer (zsh glob pattern)
+is_int() {
+  [[ "$1" == <-> ]]
+}
+
+# helper: buang karakter non-digit dari angka ffprobe (misal "48000," → "48000")
+clean_num() {
+  local v="${1//[^0-9]/}"
+  print -r -- "$v"
+}
+
+# format yang umum berisi Dolby/multichannel
+typeset -a files
+files=(
+  *.m4a *.M4A
+  *.mp4 *.MP4
+  *.mkv *.MKV
+  *.flac *.FLAC
+  *.wav  *.WAV
+  *.aac  *.AAC
+  *.alac *.ALAC
+)
+
+(( ${#files} > 0 )) || die "Tidak ada berkas yang cocok di folder ini."
+
+OUTDIR="Stereo"
+mkdir -p "$OUTDIR" || die "Gagal membuat OUTDIR: $OUTDIR"
+
+info "Output dir : $OUTDIR"
+info "Files found: ${#files}"
+
+# Matrix netral (general 7.1 → stereo stereo fold-down)
+PAN_NEUTRAL='pan=stereo|c0=FL+0.707*FC+0.707*SL+0.707*BL+0.50*LFE|c1=FR+0.707*FC+0.707*SR+0.707*BR+0.50*LFE'
+
+# Matrix khusus Dolby: dialog lebih tebal (center lebih kuat)
+PAN_DOLBY='pan=stereo|c0=FL+1.00*FC+0.65*SL+0.65*BL+0.40*LFE|c1=FR+1.00*FC+0.65*SR+0.65*BR+0.40*LFE'
+
+for f in "${files[@]}"; do
+  base="${f:t}"           # basename (zsh)
+  ext="${base:e:l}"       # extension (lowercased)
+  out="$OUTDIR/$base"
+
+  # Info sumber (raw)
+  codec="$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name         -of csv=p=0 "$f" || echo "")"
+  ch="$(ffprobe    -v error -select_streams a:0 -show_entries stream=channels           -of csv=p=0 "$f" || echo "")"
+  sr_raw="$(ffprobe  -v error -select_streams a:0 -show_entries stream=sample_rate      -of csv=p=0 "$f" || echo "")"
+  bps_raw="$(ffprobe -v error -select_streams a:0 -show_entries stream=bits_per_sample  -of csv=p=0 "$f" || echo "")"
+
+  # Bersihkan angka dari koma / char lain
+  sr="$(clean_num "$sr_raw")"
+  bps="$(clean_num "$bps_raw")"
+
+  [[ -z "$sr" ]] && sr="48000"
+
+  # Kalau sudah stereo → copy semua stream + metadata
+  if [[ "$ch" == "2" ]]; then
+    info "⏭️  Sudah stereo, copy apa adanya: $f"
+    ffmpeg -hide_banner -loglevel error -y -i "$f" \
+      -map 0 \
+      -c copy \
+      -map_metadata 0 -map_chapters 0 \
+      "$out"
+    continue
+  fi
+
+  # Pilih matrix
+  pan_expr="$PAN_NEUTRAL"
+  if [[ "$codec" == "eac3" || "$codec" == "ac3" ]]; then
+    pan_expr="$PAN_DOLBY"
+    info "🎯 Dolby terdeteksi ($codec), pakai matrix dialog-forward: $f"
+  else
+    info "🔊 Non-Dolby multichannel, pakai matrix netral: $f"
+  fi
+
+  # Encoder per-ekstensi
+  typeset -a audio_args
+  audio_args=()
+
+  case "$ext" in
+    m4a|mp4|alac)
+      # Tulis balik ke m4a/mp4 dengan ALAC, SR ikut sumber
+      if is_int "$bps" && (( bps <= 16 )); then
+        audio_args=(-c:a alac -ar "$sr" -sample_fmt s16p)
+      else
+        audio_args=(-c:a alac -ar "$sr")
+      fi
+      ;;
+    mkv)
+      # mkv fleksibel → FLAC
+      if is_int "$bps" && (( bps <= 16 )); then
+        audio_args=(-c:a flac -compression_level 12 -ar "$sr" -sample_fmt s16)
+      else
+        audio_args=(-c:a flac -compression_level 12 -ar "$sr")
+      fi
+      ;;
+    flac)
+      if is_int "$bps" && (( bps <= 16 )); then
+        audio_args=(-c:a flac -compression_level 12 -ar "$sr" -sample_fmt s16)
+      else
+        audio_args=(-c:a flac -compression_level 12 -ar "$sr")
+      fi
+      ;;
+    wav)
+      if is_int "$bps" && (( bps <= 16 )); then
+        audio_args=(-c:a pcm_s16le -ar "$sr")
+      else
+        audio_args=(-c:a pcm_s24le -ar "$sr")
+      fi
+      ;;
+    aac)
+      audio_args=(-c:a aac -b:a 320k -ar "$sr")
+      ;;
+    *)
+      # Fallback → FLAC
+      audio_args=(-c:a flac -compression_level 12 -ar "$sr")
+      ;;
+  esac
+
+  ffmpeg -hide_banner -loglevel error -y -drc_scale 0 -i "$f" \
+    -filter_complex "[0:a:0]${pan_expr},alimiter=limit=0.97[aout]" \
+    -map 0 -map -0:a:0 -map "[aout]" \
+    -map_metadata 0 -map_chapters 0 \
+    -c:v copy \
+    "${audio_args[@]}" \
+    "$out"
+
+  info "✅ Selesai: $out"
+done
+
+print "\nSelesai ✅  Semua metadata, chapters, dan subtitle dipertahankan. Output di: $OUTDIR/"
+

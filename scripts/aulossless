@@ -1,0 +1,298 @@
+#!/usr/bin/env bash
+#
+# audio_audit_advanced.sh
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025 Mohamad Adithya
+#
+# Advanced Audio Audit
+# Detects:
+#   - LOSSY_CODEC
+#   - PROB_LOSSY_TRANSCODE  (lossy -> FLAC/ALAC/WAV/AIFF)
+#   - PROB_FAKE_24BIT       (header 24-bit, real ~16-bit)
+#   - PROB_FAKE_HIRES       (high sample rate, real bit-depth ~CD)
+#   - PURE_LOSSLESS_CANDIDATE (CD-like lossless)
+#   - PURE_HIRES_CANDIDATE    (genuine hi-res candidate)
+#
+# Requirements:
+#   - ffprobe (from ffmpeg)
+#   - ffmpeg
+#   - sox
+#
+# Usage:
+#   ./audio_audit_advanced.sh /path/to/library > audit_report.csv
+#
+
+set -u
+set -o pipefail
+
+SCRIPT_NAME="$(basename "$0")"
+
+# Default root directory (can be overridden by first argument)
+ROOT="."
+
+# Extensions to scan
+EXTS=("flac" "wav" "aiff" "aif" "m4a" "alac")
+
+usage() {
+  cat <<EOF
+Advanced Audio Audit (lossless / lossy / fake-hires detector)
+
+Usage:
+  ${SCRIPT_NAME} [ROOT_DIR]
+
+If ROOT_DIR is omitted, the current directory (.) is used.
+
+The script recursively scans ROOT_DIR for audio files with extensions:
+  flac, wav, aiff, aif, m4a, alac
+
+For each file, it prints a CSV row to stdout with columns:
+  file,status,sample_rate,bits_header,bits_real,channels,bitrate,codec,duration_sec,notes
+
+Status flags:
+  LOSSY_CODEC              - File uses a known lossy codec (MP3/AAC/Opus/Vorbis/etc).
+  PROB_LOSSY_TRANSCODE     - Lossless container, but parameters look like lossy → lossless transcode.
+  PROB_FAKE_24BIT          - Header reports >16-bit, but real bit-depth is ~16-bit.
+  PROB_FAKE_HIRES          - High sample rate, but real bit-depth is ~16-bit.
+  PURE_LOSSLESS_CANDIDATE  - Looks like clean, CD-like lossless audio.
+  PURE_HIRES_CANDIDATE     - Looks like genuine hi-res audio.
+
+Requirements:
+  - ffprobe (part of ffmpeg)
+  - ffmpeg
+  - sox
+
+Examples:
+  ${SCRIPT_NAME} /path/to/library > audit_report.csv
+  ${SCRIPT_NAME} . | tee audit_report.csv
+EOF
+}
+
+require_cmd() {
+  local cmd="$1"
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "Error: required command '${cmd}' not found in PATH." >&2
+    exit 1
+  fi
+}
+
+# --------- Argument parsing ---------
+
+if (( $# > 0 )); then
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      ROOT="$1"
+      ;;
+  esac
+fi
+
+if [[ ! -d "$ROOT" ]]; then
+  echo "Error: ROOT path '${ROOT}' does not exist or is not a directory." >&2
+  exit 1
+fi
+
+# --------- Dependency checks ---------
+
+require_cmd ffprobe
+require_cmd ffmpeg
+require_cmd sox
+require_cmd find
+require_cmd awk
+require_cmd sed
+
+# --------- Utility functions ---------
+
+is_integer() {
+  [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+float_to_int() {
+  local v="$1"
+  v="${v%%.*}"
+  if ! is_integer "$v"; then
+    echo "0"
+  else
+    echo "$v"
+  fi
+}
+
+scan_file() {
+  local f="$1"
+
+  # ---------- 1) Basic info via ffprobe ----------
+  local sr_raw bps_raw br_raw ch_raw dur_raw codec_raw
+  local sr bps br ch dur codec
+
+  sr_raw=$(
+    ffprobe -v error -select_streams a:0 \
+      -show_entries stream=sample_rate -of csv=p=0 "$f" 2>/dev/null || echo "0"
+  )
+
+  bps_raw=$(
+    ffprobe -v error -select_streams a:0 \
+      -show_entries stream=bits_per_sample -of csv=p=0 "$f" 2>/dev/null || echo "0"
+  )
+
+  # bitrate from audio stream
+  br_raw=$(
+    ffprobe -v error -select_streams a:0 \
+      -show_entries stream=bit_rate -of csv=p=0 "$f" 2>/dev/null || echo "0"
+  )
+
+  # if stream-level bitrate is 0/empty, try format-level
+  if [[ "$br_raw" == "0" || -z "$br_raw" ]]; then
+    br_raw=$(
+      ffprobe -v error \
+        -show_entries format=bit_rate -of csv=p=0 "$f" 2>/dev/null || echo "0"
+    )
+  fi
+
+  ch_raw=$(
+    ffprobe -v error -select_streams a:0 \
+      -show_entries stream=channels -of csv=p=0 "$f" 2>/dev/null || echo "0"
+  )
+
+  dur_raw=$(
+    ffprobe -v error \
+      -show_entries format=duration -of csv=p=0 "$f" 2>/dev/null || echo "0"
+  )
+
+  codec_raw=$(
+    ffprobe -v error -select_streams a:0 \
+      -show_entries stream=codec_name -of csv=p=0 "$f" 2>/dev/null || echo "unknown"
+  )
+
+  sr=$(float_to_int "$sr_raw")
+  bps=$(float_to_int "$bps_raw")
+  br=$(float_to_int "$br_raw")
+  ch=$(float_to_int "$ch_raw")
+  dur=$(float_to_int "$dur_raw")
+  codec="$codec_raw"
+
+  # ---------- 2) Normalize header values ----------
+  # Many FLAC/ALAC files report bits_per_sample=0 → conservatively assume 16-bit.
+  if (( bps == 0 )); then
+    bps=16
+  fi
+
+  # ---------- 3) Real bit-depth via ffmpeg -> sox ----------
+  # Decode to WAV via pipe, then check "Bit-depth" from sox stat.
+  local bits_real_raw bits_real
+  bits_real_raw=$(
+    ffmpeg -v error -i "$f" -f wav - 2>/dev/null | \
+      sox -q -t wav - -n stat 2>&1 | awk '/Bit-depth/ {print $3}' | head -n 1
+  )
+
+  bits_real=$(float_to_int "${bits_real_raw:-0}")
+
+  # If sox fails completely, fallback to header bps.
+  if (( bits_real == 0 )); then
+    bits_real=$bps
+  fi
+
+  # ---------- 4) Heuristics ----------
+  local status="UNKNOWN"
+  local notes=""
+
+  # 4.1 Codec-level lossy vs lossless
+  case "$codec" in
+    mp3|aac|ac3|eac3|vorbis|opus)
+      status="LOSSY_CODEC"
+      notes+="codec_is_lossy;"
+      ;;
+  esac
+
+  # 4.2 PROB_LOSSY_TRANSCODE
+  # Case: lossless container (FLAC/ALAC/WAV/AIFF) but suspicious bitrate + SR.
+  # Criteria:
+  #   - SR 44.1/48 kHz
+  #   - 2 channels
+  #   - ~16-bit (header <= 16, real <= 17)
+  #   - relatively low bitrate for FLAC/ALAC
+  #     loose threshold: < 650 kbps
+  local is_lossless_container="false"
+  case "$codec" in
+    flac|alac|pcm_s16le|pcm_s24le|pcm_s32le|pcm_f32le|pcm_f64le)
+      is_lossless_container="true"
+      ;;
+  esac
+
+  if [[ "$is_lossless_container" == "true" && $br -gt 0 ]]; then
+    if (( (sr == 44100 || sr == 48000) && ch == 2 && bits_real <= 17 && br < 650000 )); then
+      if [[ "$status" == "UNKNOWN" ]]; then
+        status="PROB_LOSSY_TRANSCODE"
+      else
+        status="${status}+PROB_LOSSY_TRANSCODE"
+      fi
+      notes+="low_bitrate_cd_band;"
+    fi
+  fi
+
+  # 4.3 PROB_FAKE_24BIT
+  # Header >16-bit but real depth ~16-bit.
+  if (( bps > 16 )) && (( bits_real > 0 && bits_real <= 17 )); then
+    if [[ "$status" == "UNKNOWN" ]]; then
+      status="PROB_FAKE_24BIT"
+    else
+      status="${status}+PROB_FAKE_24BIT"
+    fi
+    notes+="real_bitdepth_~16bit;"
+  fi
+
+  # 4.4 PROB_FAKE_HIRES
+  # High sample rate (>= 88.2 kHz) but real bit-depth ~CD.
+  if (( sr >= 88200 )); then
+    if (( bits_real <= 17 )); then
+      if [[ "$status" == "UNKNOWN" ]]; then
+        status="PROB_FAKE_HIRES"
+      else
+        status="${status}+PROB_FAKE_HIRES"
+      fi
+      notes+="hi_sr_but_cd_depth;"
+    fi
+  fi
+
+  # 4.5 PURE_LOSSLESS / PURE_HIRES candidates
+  if [[ "$status" == "UNKNOWN" ]]; then
+    # CD-like lossless
+    if (( (sr == 44100 || sr == 48000) && bits_real >= 15 && bits_real <= 17 && ch == 2 )); then
+      if (( br >= 650000 && br <= 1200000 )); then
+        status="PURE_LOSSLESS_CANDIDATE"
+        notes+="cd_like_good_bitrate;"
+      else
+        status="PURE_LOSSLESS_CANDIDATE"
+        notes+="cd_like_unknown_bitrate;"
+      fi
+    fi
+
+    # Hi-res candidate
+    if (( sr > 48000 && bits_real >= 18 )); then
+      status="PURE_HIRES_CANDIDATE"
+      notes+="hires_real_bits>16;"
+    fi
+  fi
+
+  # If still UNKNOWN: leave as-is → requires manual review / spectrogram.
+
+  # ---------- 5) Print CSV ----------
+  local f_escaped
+  f_escaped=$(printf '%s\n' "$f" | sed 's/"/""/g')
+
+  echo "\"${f_escaped}\",${status},${sr},${bps},${bits_real},${ch},${br},${codec},${dur},\"${notes}\""
+}
+
+# ---------- MAIN ----------
+
+# Print CSV header
+echo "file,status,sample_rate,bits_header,bits_real,channels,bitrate,codec,duration_sec,notes"
+
+# Walk over all configured extensions
+for ext in "${EXTS[@]}"; do
+  while IFS= read -r -d '' file; do
+    scan_file "$file"
+  done < <(find "$ROOT" -type f -iname "*.${ext}" -print0)
+done
+
